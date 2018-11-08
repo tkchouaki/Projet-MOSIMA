@@ -1,0 +1,1693 @@
+extensions [table array]
+
+breed [providers provider]
+breed [consumers consumer]
+
+globals [
+  control_model test_model ; liste des composants utilisés pour chaque groupe
+  pl_min pl_max sigmas ; tables de hachage des caractéristiques des providers selon le profil
+  UGs ; table de hachage : liste des UG pour "Control" et pour "Test"
+  rho ; table de hachage : liste des reliability values
+  W rescaled_r0
+]
+
+turtles-own [
+  r phi theta ; coordonnées polaires
+  menteur ; booléen
+]
+
+providers-own [
+  profile ; good, bad...
+  references ; ratings stockés, utilisés dans le composant CR
+  current_interactions ; ratings impliquant le provider lors du tick actuel
+  mu sigma
+]
+
+consumers-own [
+  last_UG interacted? ; dernier UG reçu et booléen pour savoir si le consumer a agi à ce tick
+  components ; liste des composants utilisés par le consumer
+  ratings ; table de hachage donnant pour un provider les ratings associés
+  typ ; "Control" ou "Test"
+  alpha T
+]
+
+; n_w : nombre de témoins suffisant pour que la recherche s'arrête (dans WR)
+; r0 : le rayon de vision effectif rescaled_r0 = r0 * hauteur du cube (donc pour r0 = 1 l'agent voit dans toute la sphère)
+; degradation : défini tel que pour degradation = 1, si le consommateur est à la surface de la sphère,
+; alors pour une performance "brute" = 10, la performance dégradée atteint -10 quand le provider est exactement à l'opposée de la sphère
+
+
+to setup
+  clear-all
+
+  set W table:from-list (list (list "IT" W_IT) (list "RT" W_RT) (list "CR" W_CR) (list "WR" W_WR))
+  set rescaled_r0 r0 * world-height
+  set UGs table:from-list list (list "Control" [0]) (list "Test" [0])
+  set rho table:from-list (list (list "IT" []) (list "WR" []) (list "CR" []))
+
+  ; create hash tables of each provider type's features
+  set pl_min table:from-list (list (list "good" pl_good) (list "ordinary" pl_ok) (list "bad" pl_worst) (list "intermittent" 0))
+  set pl_max table:from-list (list (list "good" pl_perfect) (list "ordinary" pl_good) (list "bad" pl_ok) (list "intermittent" 0))
+  set sigmas table:from-list (list (list "good" sigma_good) (list "ordinary" sigma_ordinary) (list "bad" sigma_bad) (list "intermittent" 0))
+
+  ; create all providers
+  create_providers Npg "good"
+  create_providers Npo "ordinary"
+  create_providers Npb "bad"
+  create_providers Npi "intermittent"
+
+  ; create consumers
+  set control_model []
+  if IT-control [set control_model lput "IT" control_model]
+  if WR-control [set control_model lput "WR" control_model]
+  if CR-control [set control_model lput "CR" control_model]
+  create_consumers Nc "Control"
+
+  set test_model []
+  if IT-test [set test_model lput "IT" test_model]
+  if WR-test [set test_model lput "WR" test_model]
+  if CR-test [set test_model lput "CR" test_model]
+  if not empty? test_model [create_consumers Nc "Test"]
+
+  reset-ticks
+end
+
+
+to go
+  set rho table:from-list (list (list "IT" []) (list "WR" []) (list "CR" []))
+  interactions
+  if variations [
+    remove_and_add_consumers
+    remove_and_add_providers
+    move_agents_around
+    change_provider_profiles
+  ]
+  tick
+  if ticks = tick_limit - 1 [stop]
+end
+
+
+to-report mean_UG_all_consumers [le_type]
+  let group consumers with [typ = le_type and interacted? = True]
+  table:put UGs le_type sentence (table:get UGs le_type) [last_UG] of group
+  if group = no-turtles [report 0]
+  report precision (mean [last_UG] of group) 3
+  ;report precision mean (table:get UGs le_type) 3 ; alternative lissée
+end
+
+
+to create_providers [n name]
+  create-providers n [
+    set color red
+    set references []
+    set current_interactions []
+    set_provider_profile name
+    initial_placement
+  ]
+end
+
+
+to set_provider_profile [p]
+  ifelse random-float 1 < p_menteur [set menteur True] [set menteur False]
+  set profile p
+  set mu (table:get pl_min p + table:get pl_max p) / 2 ; random_in_interval table:get pl_min p table:get pl_max p
+  set sigma table:get sigmas p
+end
+
+
+to create_consumers [n le_type]
+  create-consumers n [
+    ifelse random-float 1 < p_menteur [set menteur True] [set menteur False]
+    set color yellow
+    set typ le_type
+    ifelse le_type = "Control"
+    [set components control_model]
+    [set components test_model]
+    set last_UG 0
+    set interacted? False
+    set ratings table:make
+    set alpha random_in_interval alpha_min alpha_max
+    set T T_initial
+    initial_placement
+  ]
+end
+
+
+to initial_placement
+  ; les agents sont placés aléatoirement dans la sphère délimitée par le cube
+  ; et leurs coordonnées polaires sont déduites
+  setxyz random-xcor random-ycor random-zcor
+  set r distancexyz 0 0 0
+  while [r > max-pxcor] [
+    setxyz random-xcor random-ycor random-zcor
+    set r distancexyz 0 0 0
+  ]
+  set phi acos (zcor / r)
+  set theta atan xcor ycor
+
+  ; NE DONNE PAS UN PLACEMENT ALEATOIRE
+  ;set r random max-pxcor
+  ;set phi random 180
+  ;set theta random 360
+  ;setxyz (r * (sin phi) * (sin theta)) (r * (sin phi) * (cos theta)) (r * (cos phi))
+end
+
+
+to remove_and_add_consumers
+  let p1 random-float p_cpc
+  foreach list "Control" "Test" [le_type ->
+    let groupe consumers with [typ = le_type]
+    let n round p1 * count groupe
+    ask n-of n groupe [die]
+    create_consumers n le_type
+  ]
+end
+
+
+to remove_and_add_providers
+  let p1 random-float p_ppc
+  foreach ["good" "ordinary" "bad" "intermittent"] [prfl ->
+    let groupe providers with [profile = prfl]
+    let n round p1 * count groupe
+    ask n-of n groupe [die]
+    create_providers n prfl
+  ]
+end
+
+
+; PHI TEND VERS ZERO ?!? (imperceptible sur 500 ticks et si les agents sont remplaces assez tot)
+to move_agents_around
+  ask (turtle-set consumers providers) [
+    if random-float 1 < p_clc [
+
+      ; modifying phi
+      set phi phi + variation delta_phi
+
+      ifelse phi < 0 [
+        set phi (- phi)
+        set theta (theta + 180) mod 360
+      ][
+        if phi > 180 [
+          set phi 360 - phi
+          set theta (theta + 180) mod 360
+        ]
+      ]
+
+      ; modifying theta
+      set theta (theta + variation delta_phi) mod 360
+
+      ; setting corresponding xyz coordinates
+      setxyz (r * (sin phi) * (sin theta)) (r * (sin phi) * (cos theta)) (r * (cos phi))
+    ]
+  ]
+end
+
+
+to change_provider_profiles
+  ask providers [
+    if random-float 1 < p_muc [set mu in_UG_limits (mu + variation M)]
+    if random-float 1 < p_ps [set_provider_profile one-of remove profile table:keys sigmas] ; profil choisi aleatoirement...
+  ]
+end
+
+
+to interactions
+  ask consumers [
+    set interacted? False
+    let the_service 1 ; should be : for service in list_services...
+    if random-float 1 < alpha [interact the_service]
+    set T max list 1 (T - T_decrease_rate) ; temperature decreases
+  ]
+  ask providers [update_references] ; updating references
+end
+
+
+to interact [the_service]
+  let reachable_providers providers with [distance myself < rescaled_r0] ; on vérifie qu'on peut contacter des fournisseurs directement
+  ifelse reachable_providers = no-turtles [
+    let reached_provider fetch_provider ; sinon, on essaye d'en trouver un en demandant aux autres consommateurs
+    if reached_provider != nobody [rate_interaction reached_provider the_service]
+  ][
+    ifelse empty? components [ ; pour NoTrust, on sélectionne un fournisseur au hasard
+      rate_interaction one-of reachable_providers the_service
+    ][
+      ; determining most trustworthy provider
+      let max_trust_value -2
+      let most_trusted_provider nobody
+      let no_trust_value_providers no-turtles
+      foreach sort reachable_providers [potential_provider ->
+        let tmp get_trust_value potential_provider the_service
+        ifelse tmp < -1 [ ; if no trust value
+          set no_trust_value_providers (turtle-set no_trust_value_providers potential_provider)
+        ][
+          if tmp > max_trust_value [
+            set max_trust_value tmp
+            set most_trusted_provider potential_provider
+          ]
+        ]
+      ]
+
+      ; légère modification de la stratégie d'exploration de l'article : ralentit la convergence mais améliore l'adaptation
+      ;if typ = "Test" and no_trust_value_providers = no-turtles [set no_trust_value_providers reachable_providers]
+
+      ; interacting
+      ifelse most_trusted_provider = nobody or (no_trust_value_providers != no-turtles and random-float 1 < exploration_probability max_trust_value)
+      [rate_interaction one-of no_trust_value_providers the_service]
+      [rate_interaction most_trusted_provider the_service]
+    ]
+  ]
+end
+
+
+; déduit de la figure 4
+; on s'arrête dès qu'on a trouvé un provider
+to-report fetch_provider
+  let iteration 0
+  let tmp_contacts no-turtles
+  let origin self
+  let reached_provider nobody
+  let neighbours other consumers in-radius rescaled_r0
+  let contacts max-n-of (min list n_bf count neighbours) neighbours [distance origin]
+  let deja_vu turtle-set self
+
+  while [reached_provider = nobody and contacts != no-turtles and iteration < n_rl] [
+    ask contacts [
+      let reachable_providers providers with [distance myself < rescaled_r0]
+      ifelse reachable_providers = no-turtles [
+        set neighbours other consumers in-radius rescaled_r0
+        set tmp_contacts (turtle-set tmp_contacts max-n-of (min list n_bf count neighbours) neighbours [distance origin])
+      ][
+        set reached_provider min-one-of reachable_providers [distance origin]
+      ]
+    ]
+    set deja_vu (turtle-set deja_vu contacts)
+    set contacts (turtle-set filter [c -> not member? c deja_vu] sort tmp_contacts)
+    set tmp_contacts no-turtles
+    set iteration iteration + 1
+  ]
+
+  report reached_provider
+end
+
+
+; consumer reporter
+to-report exploration_probability [max_trust_value]
+  let trust_part exp (10 * max_trust_value / T)
+  let random_part 1 ; moyenne des UG par défaut = 0
+  if not empty? table:keys ratings [set random_part exp (mean_UG_one_consumer / T)]
+  report random_part / (random_part + trust_part)
+end
+
+
+; consumer reporter
+to-report get_trust_value [potential_provider the_service]
+  let sum_wT 0
+  let sum_w 0
+  let no_trust_value True
+  foreach components [component ->
+    let matching_ratings get_matching_ratings component potential_provider the_service
+    if not empty? matching_ratings [
+      set no_trust_value False
+      let trust_value_component get_trust_value_component component matching_ratings
+      let ww table:get W component * reliability component matching_ratings trust_value_component
+      set sum_wT sum_wT + ww * trust_value_component
+      set sum_w sum_w + ww
+    ]
+  ]
+  if no_trust_value [report -10] ; no trust value
+  if sum_w = 0 [report 0] ; en réalité, c'est plutôt équivalent à no trust value... Dans l'idéal il faudrait que plus la rating reliability d'un provider soit faible, plus on ait de chances de l'explorer
+  report sum_wT / sum_w
+end
+
+
+to-report get_matching_ratings [component the_provider the_service]
+  if component = "IT" [
+    if not table:has-key? ratings [who] of the_provider [report []]
+    report filter [rating -> get_service rating = the_service] table:get ratings [who] of the_provider
+  ]
+
+  if component = "CR" [report [references] of the_provider]
+
+  if component = "WR" [
+    let iteration 0
+    let witnesses 0
+    let obtained_ratings []
+    let tmp_contacts no-turtles
+    let neighbours other consumers in-radius rescaled_r0
+    let contacts min-n-of (min list n_bf count neighbours) neighbours [distance the_provider]
+    let deja_vu turtle-set self
+
+    while [iteration < n_rl and witnesses < n_w] [
+      ask contacts [
+        let tmp get_matching_ratings "IT" the_provider the_service
+        ifelse empty? tmp [
+          set neighbours other consumers in-radius rescaled_r0
+          set tmp_contacts (turtle-set tmp_contacts min-n-of (min list n_bf count neighbours) neighbours [distance the_provider])
+        ][
+          if menteur [set tmp map distorted_consumer_rating tmp]
+          set obtained_ratings sentence obtained_ratings tmp
+          set witnesses witnesses + 1
+        ]
+      ]
+
+      set deja_vu (turtle-set deja_vu contacts)
+      set contacts (turtle-set filter [c -> not member? c deja_vu] sort tmp_contacts)
+      set tmp_contacts no-turtles
+      set iteration iteration + 1
+    ]
+
+    report obtained_ratings
+  ]
+
+  ; if component = "RT" [...]
+end
+
+
+to-report get_trust_value_component [component matching_ratings]
+  report sum map [rating -> get_v rating * omega component rating] matching_ratings / sum map [rating -> omega component rating] matching_ratings
+end
+
+
+to-report reliability [component matching_ratings trust_value_c]
+  let rho_r 1 - exp (- gamma * sum map [rating -> omega component rating] matching_ratings)
+  let rho_d 1 - (sum map [rating -> omega component rating * abs (get_v rating - trust_value_c)] matching_ratings / (2 * sum map [rating -> omega component rating] matching_ratings))
+  let tmp rho_r * rho_d
+  if typ = "Control" [table:put rho component (fput tmp (table:get rho component))]
+  report tmp
+end
+
+
+to-report omega [component the_rating]
+  ifelse component = "RT"
+  [report get_t the_rating] ; in rules, e = t ?
+  [report exp ((get_t the_rating - ticks) / lambda)]
+end
+
+
+; consumer procedure
+to rate_interaction [chosen_provider the_service]
+  let UG performance chosen_provider
+  set last_UG UG
+  set interacted? True
+  let new_rating array:from-list (list ticks UG (UG / 10) the_service)
+
+  ; update personal rating list (size limit for one provider = H)
+  ifelse not table:has-key? ratings [who] of chosen_provider [
+    table:put ratings [who] of chosen_provider (list new_rating)
+  ][
+    let new_ratings fput new_rating table:get ratings [who] of chosen_provider
+    if length new_ratings > H [set new_ratings but-last new_ratings]
+    table:put ratings [who] of chosen_provider new_ratings
+  ]
+
+  ask chosen_provider [set current_interactions fput new_rating current_interactions]
+end
+
+
+; consumer reporter !
+to-report performance [the_provider]
+  let perf 0
+  ask the_provider [
+    ifelse profile = "intermittent"
+    [set perf random_in_interval pl_bad pl_good]
+    [set perf in_UG_limits random-normal mu sigma]
+  ]
+
+  let d distance the_provider - rescaled_r0
+  ifelse d < 0 [report perf]
+  [report max list -10 (perf - (d / (world-height - rescaled_r0)) * 20 * degradation)]
+end
+
+
+; provider procedure
+to update_references
+
+  if menteur [set current_interactions map distorted_provider_rating current_interactions]
+
+  ; garde les H références les mieux notées de toutes ses interactions
+  let tmp sort-by [[i1 i2] -> get_v i1 > get_v i2] sentence references current_interactions
+  set references sublist tmp 0 (min list H length tmp)
+
+  ; on garde les H meilleurs interactions du tour qui se termine
+  ;let tmp sort-by [[i1 i2] -> get_v i1 > get_v i2] current_interactions
+  ;set references sublist tmp 0 (min list H length tmp)
+
+  ;let tmp sort-by [[i1 i2] -> get_v i1 > get_v i2] current_interactions
+  ;set references sentence references sublist tmp 0 (min list H length tmp)
+
+  ; meh
+  ;let tmp sort-by [[i1 i2] -> get_v i1 > get_v i2] sentence (filter [i -> ticks - get_t i < H] references) current_interactions
+  ;set references sublist tmp 0 (min list H length tmp)
+
+  set current_interactions []
+end
+
+
+to-report distorted_consumer_rating [rating] ; si le contact est un menteur, il inverse les notes qu'il a donné
+  let new_v (- get_v rating)
+  report array:from-list (list get_t rating get_UG rating new_v get_service rating)
+end
+
+
+to-report distorted_provider_rating [rating] ; si le provider est un menteur, il prétend être de type "good"
+  let fake_mu (table:get pl_min "good" + table:get pl_max "good") / 2 ; random_in_interval table:get pl_min p table:get pl_max p
+  let fake_sigma table:get sigmas "good"
+  let new_UG in_UG_limits random-normal fake_mu fake_sigma
+  report array:from-list (list get_t rating new_UG (new_UG / 10) get_service rating)
+end
+
+
+to-report mean_UG_one_consumer
+  let list_UG []
+  foreach table:keys ratings [the_provider ->
+    foreach table:get ratings the_provider [rating ->
+      set list_UG fput get_UG rating list_UG
+    ]
+  ]
+  report mean list_UG
+end
+
+
+to-report get_t [rating]
+  report array:item rating 0
+end
+
+
+to-report get_UG [rating]
+  report array:item rating 1
+end
+
+
+to-report get_v [rating]
+  report array:item rating 2
+end
+
+
+to-report get_service [rating]
+  report array:item rating 3
+end
+
+
+to-report variation [bound]
+  report (random-float (2 * bound)) - bound
+end
+
+
+to-report random_in_interval [mini maxi]
+  report (mini + random-float (maxi - mini))
+end
+
+
+to-report in_UG_limits [value]
+  report max (list pl_worst (min (list pl_perfect value)))
+end
+@#$#@#$#@
+GRAPHICS-WINDOW
+0
+0
+439
+460
+-1
+-1
+13.0
+1
+10
+1
+1
+1
+0
+1
+1
+1
+-16
+16
+-16
+16
+-16
+16
+1
+0
+1
+ticks
+30.0
+
+SLIDER
+441
+25
+613
+58
+T_initial
+T_initial
+1
+100
+100.0
+.1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+441
+60
+613
+93
+T_decrease_rate
+T_decrease_rate
+0
+1
+1.0
+.01
+1
+NIL
+HORIZONTAL
+
+SLIDER
+441
+96
+613
+129
+n_w
+n_w
+0
+50
+10.0
+1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+441
+132
+613
+165
+r0
+r0
+0
+1
+0.2
+.01
+1
+NIL
+HORIZONTAL
+
+SLIDER
+23
+352
+195
+385
+H
+H
+0
+100
+10.0
+1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+23
+401
+195
+434
+alpha_min
+alpha_min
+0
+1
+0.25
+.01
+1
+NIL
+HORIZONTAL
+
+SLIDER
+23
+438
+195
+471
+alpha_max
+alpha_max
+0
+1
+1.0
+.01
+1
+NIL
+HORIZONTAL
+
+SLIDER
+24
+24
+196
+57
+sigma_good
+sigma_good
+0
+10
+1.0
+.1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+24
+61
+196
+94
+sigma_ordinary
+sigma_ordinary
+0
+10
+2.0
+.1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+23
+97
+195
+130
+sigma_bad
+sigma_bad
+0
+10
+2.0
+.1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+23
+178
+195
+211
+pl_good
+pl_good
+-10
+10
+5.0
+1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+23
+213
+195
+246
+pl_ok
+pl_ok
+-10
+10
+0.0
+1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+23
+248
+195
+281
+pl_bad
+pl_bad
+-10
+10
+-5.0
+1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+23
+143
+195
+176
+pl_perfect
+pl_perfect
+-10
+10
+10.0
+1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+23
+284
+195
+317
+pl_worst
+pl_worst
+-10
+10
+-10.0
+1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+228
+253
+400
+286
+p_cpc
+p_cpc
+0
+1
+0.05
+.01
+1
+NIL
+HORIZONTAL
+
+SLIDER
+228
+289
+400
+322
+p_ppc
+p_ppc
+0
+1
+0.02
+.01
+1
+NIL
+HORIZONTAL
+
+SLIDER
+228
+339
+400
+372
+p_clc
+p_clc
+0
+1
+0.1
+.01
+1
+NIL
+HORIZONTAL
+
+SLIDER
+228
+375
+400
+408
+p_plc
+p_plc
+0
+1
+0.1
+0.01
+1
+NIL
+HORIZONTAL
+
+SLIDER
+228
+460
+400
+493
+p_muc
+p_muc
+0
+1
+0.1
+.01
+1
+NIL
+HORIZONTAL
+
+SLIDER
+228
+544
+400
+577
+p_ps
+p_ps
+0
+1
+0.02
+.01
+1
+NIL
+HORIZONTAL
+
+SLIDER
+228
+411
+400
+444
+delta_phi
+delta_phi
+0
+180
+9.0
+1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+228
+496
+400
+529
+M
+M
+0
+10
+1.0
+1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+441
+232
+613
+265
+Nc
+Nc
+1
+500
+100.0
+1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+441
+268
+613
+301
+Npg
+Npg
+0
+100
+10.0
+1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+441
+305
+613
+338
+Npo
+Npo
+0
+100
+40.0
+1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+441
+342
+613
+375
+Npb
+Npb
+0
+100
+45.0
+1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+441
+379
+613
+412
+Npi
+Npi
+0
+100
+5.0
+1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+23
+489
+195
+522
+lambda
+lambda
+0
+10
+7.21
+.01
+1
+NIL
+HORIZONTAL
+
+SLIDER
+23
+539
+195
+572
+n_bf
+n_bf
+0
+10
+2.0
+1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+23
+576
+195
+609
+n_rl
+n_rl
+0
+10
+5.0
+1
+1
+NIL
+HORIZONTAL
+
+PLOT
+679
+30
+1457
+348
+Plot UG
+time
+UG
+0.0
+200.0
+-2.0
+7.0
+true
+true
+"" ""
+PENS
+"Control" 1.0 0 -2674135 true "" "plot mean_UG_all_consumers \"Control\""
+"Test" 1.0 0 -13840069 true "" "if not empty? test_model [plot mean_UG_all_consumers \"Test\"]"
+
+SLIDER
+228
+24
+400
+57
+W_IT
+W_IT
+0
+10
+2.0
+.1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+228
+61
+400
+94
+W_RT
+W_RT
+0
+10
+2.0
+.1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+228
+99
+400
+132
+W_WR
+W_WR
+0
+10
+1.0
+.1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+228
+136
+400
+169
+W_CR
+W_CR
+0
+10
+0.5
+.1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+228
+189
+400
+222
+gamma
+gamma
+0
+1
+0.69
+.01
+1
+NIL
+HORIZONTAL
+
+BUTTON
+442
+563
+505
+596
+NIL
+setup
+NIL
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+1
+
+BUTTON
+522
+563
+585
+596
+NIL
+go
+T
+1
+T
+OBSERVER
+NIL
+NIL
+NIL
+NIL
+1
+
+SWITCH
+442
+444
+544
+477
+IT-control
+IT-control
+1
+1
+-1000
+
+SWITCH
+442
+479
+544
+512
+WR-control
+WR-control
+1
+1
+-1000
+
+SWITCH
+442
+514
+544
+547
+CR-control
+CR-control
+1
+1
+-1000
+
+SLIDER
+441
+607
+613
+640
+tick_limit
+tick_limit
+0
+500
+200.0
+1
+1
+NIL
+HORIZONTAL
+
+SLIDER
+441
+168
+613
+201
+degradation
+degradation
+0
+2
+0.2
+.01
+1
+NIL
+HORIZONTAL
+
+SWITCH
+550
+444
+640
+477
+IT-test
+IT-test
+0
+1
+-1000
+
+SWITCH
+550
+479
+640
+512
+WR-test
+WR-test
+0
+1
+-1000
+
+SWITCH
+550
+514
+640
+547
+CR-test
+CR-test
+0
+1
+-1000
+
+SWITCH
+228
+598
+338
+631
+variations
+variations
+0
+1
+-1000
+
+PLOT
+676
+406
+929
+601
+Histogramme distribution UG
+NIL
+NIL
+-10.0
+10.0
+0.0
+10.0
+true
+true
+"" ""
+PENS
+"Control" 1.0 0 -2674135 true "" "histogram  table:get UGs \"Control\""
+"Test" 1.0 0 -13840069 true "" "if not empty? test_model [histogram  table:get UGs \"Test\"]"
+
+MONITOR
+960
+407
+1071
+452
+Moyenne UG Control
+precision mean (table:get UGs \"Control\") 3
+17
+1
+11
+
+MONITOR
+1080
+407
+1188
+452
+Variance UG Control
+precision variance (table:get UGs \"Control\") 3
+17
+1
+11
+
+MONITOR
+960
+460
+1071
+505
+Moyenne UG Test
+precision mean (table:get UGs \"Test\") 3
+17
+1
+11
+
+MONITOR
+1080
+460
+1188
+505
+Variance UG Test
+precision variance (table:get UGs \"Test\") 3
+17
+1
+11
+
+PLOT
+1218
+407
+1457
+603
+ Rho Control
+NIL
+NIL
+0.0
+200.0
+0.0
+1.0
+true
+true
+"" ""
+PENS
+"IT" 1.0 0 -955883 true "" "ifelse not empty? table:get rho \"IT\" [plot mean table:get rho \"IT\"][plot 0]"
+"WR" 1.0 0 -13791810 true "" "ifelse not empty? table:get rho \"WR\" [plot mean table:get rho \"WR\"][plot 0]"
+"CR" 1.0 0 -5825686 true "" "ifelse not empty? table:get rho \"CR\" [plot mean table:get rho \"CR\"][plot 0]"
+
+SLIDER
+987
+563
+1159
+596
+p_menteur
+p_menteur
+0
+1
+0.0
+.01
+1
+NIL
+HORIZONTAL
+
+@#$#@#$#@
+## WHAT IS IT?
+
+(a general understanding of what the model is trying to show or explain)
+
+## HOW IT WORKS
+
+(what rules the agents use to create the overall behavior of the model)
+
+## HOW TO USE IT
+
+(how to use the model, including a description of each of the items in the Interface tab)
+
+## THINGS TO NOTICE
+
+(suggested things for the user to notice while running the model)
+
+## THINGS TO TRY
+
+(suggested things for the user to try to do (move sliders, switches, etc.) with the model)
+
+## EXTENDING THE MODEL
+
+(suggested things to add or change in the Code tab to make the model more complicated, detailed, accurate, etc.)
+
+## NETLOGO FEATURES
+
+(interesting or unusual features of NetLogo that the model uses, particularly in the Code tab; or where workarounds were needed for missing features)
+
+## RELATED MODELS
+
+(models in the NetLogo Models Library and elsewhere which are of related interest)
+
+## CREDITS AND REFERENCES
+
+(a reference to the model's URL on the web if it has one, as well as any other necessary credits, citations, and links)
+@#$#@#$#@
+default
+true
+0
+Polygon -7500403 true true 150 5 40 250 150 205 260 250
+
+airplane
+true
+0
+Polygon -7500403 true true 150 0 135 15 120 60 120 105 15 165 15 195 120 180 135 240 105 270 120 285 150 270 180 285 210 270 165 240 180 180 285 195 285 165 180 105 180 60 165 15
+
+arrow
+true
+0
+Polygon -7500403 true true 150 0 0 150 105 150 105 293 195 293 195 150 300 150
+
+box
+false
+0
+Polygon -7500403 true true 150 285 285 225 285 75 150 135
+Polygon -7500403 true true 150 135 15 75 150 15 285 75
+Polygon -7500403 true true 15 75 15 225 150 285 150 135
+Line -16777216 false 150 285 150 135
+Line -16777216 false 150 135 15 75
+Line -16777216 false 150 135 285 75
+
+bug
+true
+0
+Circle -7500403 true true 96 182 108
+Circle -7500403 true true 110 127 80
+Circle -7500403 true true 110 75 80
+Line -7500403 true 150 100 80 30
+Line -7500403 true 150 100 220 30
+
+butterfly
+true
+0
+Polygon -7500403 true true 150 165 209 199 225 225 225 255 195 270 165 255 150 240
+Polygon -7500403 true true 150 165 89 198 75 225 75 255 105 270 135 255 150 240
+Polygon -7500403 true true 139 148 100 105 55 90 25 90 10 105 10 135 25 180 40 195 85 194 139 163
+Polygon -7500403 true true 162 150 200 105 245 90 275 90 290 105 290 135 275 180 260 195 215 195 162 165
+Polygon -16777216 true false 150 255 135 225 120 150 135 120 150 105 165 120 180 150 165 225
+Circle -16777216 true false 135 90 30
+Line -16777216 false 150 105 195 60
+Line -16777216 false 150 105 105 60
+
+car
+false
+0
+Polygon -7500403 true true 300 180 279 164 261 144 240 135 226 132 213 106 203 84 185 63 159 50 135 50 75 60 0 150 0 165 0 225 300 225 300 180
+Circle -16777216 true false 180 180 90
+Circle -16777216 true false 30 180 90
+Polygon -16777216 true false 162 80 132 78 134 135 209 135 194 105 189 96 180 89
+Circle -7500403 true true 47 195 58
+Circle -7500403 true true 195 195 58
+
+circle
+false
+0
+Circle -7500403 true true 0 0 300
+
+circle 2
+false
+0
+Circle -7500403 true true 0 0 300
+Circle -16777216 true false 30 30 240
+
+cow
+false
+0
+Polygon -7500403 true true 200 193 197 249 179 249 177 196 166 187 140 189 93 191 78 179 72 211 49 209 48 181 37 149 25 120 25 89 45 72 103 84 179 75 198 76 252 64 272 81 293 103 285 121 255 121 242 118 224 167
+Polygon -7500403 true true 73 210 86 251 62 249 48 208
+Polygon -7500403 true true 25 114 16 195 9 204 23 213 25 200 39 123
+
+cylinder
+false
+0
+Circle -7500403 true true 0 0 300
+
+dot
+false
+0
+Circle -7500403 true true 90 90 120
+
+face happy
+false
+0
+Circle -7500403 true true 8 8 285
+Circle -16777216 true false 60 75 60
+Circle -16777216 true false 180 75 60
+Polygon -16777216 true false 150 255 90 239 62 213 47 191 67 179 90 203 109 218 150 225 192 218 210 203 227 181 251 194 236 217 212 240
+
+face neutral
+false
+0
+Circle -7500403 true true 8 7 285
+Circle -16777216 true false 60 75 60
+Circle -16777216 true false 180 75 60
+Rectangle -16777216 true false 60 195 240 225
+
+face sad
+false
+0
+Circle -7500403 true true 8 8 285
+Circle -16777216 true false 60 75 60
+Circle -16777216 true false 180 75 60
+Polygon -16777216 true false 150 168 90 184 62 210 47 232 67 244 90 220 109 205 150 198 192 205 210 220 227 242 251 229 236 206 212 183
+
+fish
+false
+0
+Polygon -1 true false 44 131 21 87 15 86 0 120 15 150 0 180 13 214 20 212 45 166
+Polygon -1 true false 135 195 119 235 95 218 76 210 46 204 60 165
+Polygon -1 true false 75 45 83 77 71 103 86 114 166 78 135 60
+Polygon -7500403 true true 30 136 151 77 226 81 280 119 292 146 292 160 287 170 270 195 195 210 151 212 30 166
+Circle -16777216 true false 215 106 30
+
+flag
+false
+0
+Rectangle -7500403 true true 60 15 75 300
+Polygon -7500403 true true 90 150 270 90 90 30
+Line -7500403 true 75 135 90 135
+Line -7500403 true 75 45 90 45
+
+flower
+false
+0
+Polygon -10899396 true false 135 120 165 165 180 210 180 240 150 300 165 300 195 240 195 195 165 135
+Circle -7500403 true true 85 132 38
+Circle -7500403 true true 130 147 38
+Circle -7500403 true true 192 85 38
+Circle -7500403 true true 85 40 38
+Circle -7500403 true true 177 40 38
+Circle -7500403 true true 177 132 38
+Circle -7500403 true true 70 85 38
+Circle -7500403 true true 130 25 38
+Circle -7500403 true true 96 51 108
+Circle -16777216 true false 113 68 74
+Polygon -10899396 true false 189 233 219 188 249 173 279 188 234 218
+Polygon -10899396 true false 180 255 150 210 105 210 75 240 135 240
+
+house
+false
+0
+Rectangle -7500403 true true 45 120 255 285
+Rectangle -16777216 true false 120 210 180 285
+Polygon -7500403 true true 15 120 150 15 285 120
+Line -16777216 false 30 120 270 120
+
+leaf
+false
+0
+Polygon -7500403 true true 150 210 135 195 120 210 60 210 30 195 60 180 60 165 15 135 30 120 15 105 40 104 45 90 60 90 90 105 105 120 120 120 105 60 120 60 135 30 150 15 165 30 180 60 195 60 180 120 195 120 210 105 240 90 255 90 263 104 285 105 270 120 285 135 240 165 240 180 270 195 240 210 180 210 165 195
+Polygon -7500403 true true 135 195 135 240 120 255 105 255 105 285 135 285 165 240 165 195
+
+line
+true
+0
+Line -7500403 true 150 0 150 300
+
+line half
+true
+0
+Line -7500403 true 150 0 150 150
+
+pentagon
+false
+0
+Polygon -7500403 true true 150 15 15 120 60 285 240 285 285 120
+
+person
+false
+0
+Circle -7500403 true true 110 5 80
+Polygon -7500403 true true 105 90 120 195 90 285 105 300 135 300 150 225 165 300 195 300 210 285 180 195 195 90
+Rectangle -7500403 true true 127 79 172 94
+Polygon -7500403 true true 195 90 240 150 225 180 165 105
+Polygon -7500403 true true 105 90 60 150 75 180 135 105
+
+plant
+false
+0
+Rectangle -7500403 true true 135 90 165 300
+Polygon -7500403 true true 135 255 90 210 45 195 75 255 135 285
+Polygon -7500403 true true 165 255 210 210 255 195 225 255 165 285
+Polygon -7500403 true true 135 180 90 135 45 120 75 180 135 210
+Polygon -7500403 true true 165 180 165 210 225 180 255 120 210 135
+Polygon -7500403 true true 135 105 90 60 45 45 75 105 135 135
+Polygon -7500403 true true 165 105 165 135 225 105 255 45 210 60
+Polygon -7500403 true true 135 90 120 45 150 15 180 45 165 90
+
+sheep
+false
+15
+Circle -1 true true 203 65 88
+Circle -1 true true 70 65 162
+Circle -1 true true 150 105 120
+Polygon -7500403 true false 218 120 240 165 255 165 278 120
+Circle -7500403 true false 214 72 67
+Rectangle -1 true true 164 223 179 298
+Polygon -1 true true 45 285 30 285 30 240 15 195 45 210
+Circle -1 true true 3 83 150
+Rectangle -1 true true 65 221 80 296
+Polygon -1 true true 195 285 210 285 210 240 240 210 195 210
+Polygon -7500403 true false 276 85 285 105 302 99 294 83
+Polygon -7500403 true false 219 85 210 105 193 99 201 83
+
+square
+false
+0
+Rectangle -7500403 true true 30 30 270 270
+
+square 2
+false
+0
+Rectangle -7500403 true true 30 30 270 270
+Rectangle -16777216 true false 60 60 240 240
+
+star
+false
+0
+Polygon -7500403 true true 151 1 185 108 298 108 207 175 242 282 151 216 59 282 94 175 3 108 116 108
+
+target
+false
+0
+Circle -7500403 true true 0 0 300
+Circle -16777216 true false 30 30 240
+Circle -7500403 true true 60 60 180
+Circle -16777216 true false 90 90 120
+Circle -7500403 true true 120 120 60
+
+tree
+false
+0
+Circle -7500403 true true 118 3 94
+Rectangle -6459832 true false 120 195 180 300
+Circle -7500403 true true 65 21 108
+Circle -7500403 true true 116 41 127
+Circle -7500403 true true 45 90 120
+Circle -7500403 true true 104 74 152
+
+triangle
+false
+0
+Polygon -7500403 true true 150 30 15 255 285 255
+
+triangle 2
+false
+0
+Polygon -7500403 true true 150 30 15 255 285 255
+Polygon -16777216 true false 151 99 225 223 75 224
+
+truck
+false
+0
+Rectangle -7500403 true true 4 45 195 187
+Polygon -7500403 true true 296 193 296 150 259 134 244 104 208 104 207 194
+Rectangle -1 true false 195 60 195 105
+Polygon -16777216 true false 238 112 252 141 219 141 218 112
+Circle -16777216 true false 234 174 42
+Rectangle -7500403 true true 181 185 214 194
+Circle -16777216 true false 144 174 42
+Circle -16777216 true false 24 174 42
+Circle -7500403 false true 24 174 42
+Circle -7500403 false true 144 174 42
+Circle -7500403 false true 234 174 42
+
+turtle
+true
+0
+Polygon -10899396 true false 215 204 240 233 246 254 228 266 215 252 193 210
+Polygon -10899396 true false 195 90 225 75 245 75 260 89 269 108 261 124 240 105 225 105 210 105
+Polygon -10899396 true false 105 90 75 75 55 75 40 89 31 108 39 124 60 105 75 105 90 105
+Polygon -10899396 true false 132 85 134 64 107 51 108 17 150 2 192 18 192 52 169 65 172 87
+Polygon -10899396 true false 85 204 60 233 54 254 72 266 85 252 107 210
+Polygon -7500403 true true 119 75 179 75 209 101 224 135 220 225 175 261 128 261 81 224 74 135 88 99
+
+wheel
+false
+0
+Circle -7500403 true true 3 3 294
+Circle -16777216 true false 30 30 240
+Line -7500403 true 150 285 150 15
+Line -7500403 true 15 150 285 150
+Circle -7500403 true true 120 120 60
+Line -7500403 true 216 40 79 269
+Line -7500403 true 40 84 269 221
+Line -7500403 true 40 216 269 79
+Line -7500403 true 84 40 221 269
+
+wolf
+false
+0
+Polygon -16777216 true false 253 133 245 131 245 133
+Polygon -7500403 true true 2 194 13 197 30 191 38 193 38 205 20 226 20 257 27 265 38 266 40 260 31 253 31 230 60 206 68 198 75 209 66 228 65 243 82 261 84 268 100 267 103 261 77 239 79 231 100 207 98 196 119 201 143 202 160 195 166 210 172 213 173 238 167 251 160 248 154 265 169 264 178 247 186 240 198 260 200 271 217 271 219 262 207 258 195 230 192 198 210 184 227 164 242 144 259 145 284 151 277 141 293 140 299 134 297 127 273 119 270 105
+Polygon -7500403 true true -1 195 14 180 36 166 40 153 53 140 82 131 134 133 159 126 188 115 227 108 236 102 238 98 268 86 269 92 281 87 269 103 269 113
+
+x
+false
+0
+Polygon -7500403 true true 270 75 225 30 30 225 75 270
+Polygon -7500403 true true 30 75 75 30 270 225 225 270
+@#$#@#$#@
+NetLogo 3D 6.0.4
+@#$#@#$#@
+need-to-manually-make-preview-for-this-model
+@#$#@#$#@
+@#$#@#$#@
+@#$#@#$#@
+@#$#@#$#@
+default
+0.0
+-0.2 0 0.0 1.0
+0.0 1 1.0 0.0
+0.2 0 0.0 1.0
+link direction
+true
+0
+Line -7500403 true 150 150 90 180
+Line -7500403 true 150 150 210 180
+@#$#@#$#@
+0
+@#$#@#$#@
