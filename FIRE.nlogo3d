@@ -28,6 +28,8 @@ consumers-own [
   components ; liste des composants utilisés par le consumer
   ratings ; table de hachage donnant pour un provider les ratings associés
   typ ; "Control" ou "Test"
+  all_matching_ratings ; table de hachage contenant les ratings obtenus pour chaque composant lors des calculs de trust value (utilisé contre les menteurs)
+  defiance ; table de hachage stockant pour chaque agent informateur (CR ou WR) l'écart en valeur absolue entre la moyenne des valeurs reportées la dernière fois par cet agent et la valeur reçue (utilisé contre les menteurs)
   alpha T
 ]
 
@@ -67,7 +69,7 @@ to setup
   if IT-test [set test_model lput "IT" test_model]
   if WR-test [set test_model lput "WR" test_model]
   if CR-test [set test_model lput "CR" test_model]
-  if not empty? test_model [create_consumers Nc "Test"]
+  if not empty? test_model [create_consumers Nc "Test"] ; lorsque l'on désactive tous les composants, on enlève le groupe test
 
   reset-ticks
 end
@@ -134,6 +136,7 @@ to create_consumers [n le_type]
     set ratings table:make
     set alpha random_in_interval alpha_min alpha_max
     set T T_initial
+    set defiance table:make
     initial_placement
   ]
 end
@@ -150,12 +153,6 @@ to initial_placement
   ]
   set phi acos (zcor / r)
   set theta atan xcor ycor
-
-  ; NE DONNE PAS UN PLACEMENT ALEATOIRE
-  ;set r random max-pxcor
-  ;set phi random 180
-  ;set theta random 360
-  ;setxyz (r * (sin phi) * (sin theta)) (r * (sin phi) * (cos theta)) (r * (cos phi))
 end
 
 
@@ -222,13 +219,16 @@ to interactions
     set interacted? False
     let the_service 1 ; should be : for service in list_services...
     if random-float 1 < alpha [interact the_service]
-    set T max list min_T (T - T_decrease_rate) ; temperature decreases
+    set T max list T_min (T - T_decrease_rate) ; temperature decreases
   ]
   ask providers [update_references] ; updating references
 end
 
 
 to interact [the_service]
+
+  if typ = "Test" and p_menteur > 0 [set all_matching_ratings table:from-list map [component -> (list component [])] ["RT" "CR" "WR"]]
+
   let reachable_providers providers with [distance myself < rescaled_r0] ; on vérifie qu'on peut contacter des fournisseurs directement
   ifelse reachable_providers = no-turtles [
     let reached_provider fetch_provider ; sinon, on essaye d'en trouver un en demandant aux autres consommateurs
@@ -312,6 +312,7 @@ to-report get_trust_value [potential_provider the_service]
   let no_trust_value True
   foreach components [component ->
     let matching_ratings get_matching_ratings component potential_provider the_service
+    if component != "IT" and typ = "Test" and p_menteur > 0 [table:put all_matching_ratings component sentence (table:get all_matching_ratings component) matching_ratings]
     if not empty? matching_ratings [
       set no_trust_value False
       let trust_value_component get_trust_value_component component matching_ratings
@@ -384,18 +385,25 @@ end
 
 
 to-report omega [component the_rating]
-  ifelse component = "RT"
-  [report get_t the_rating] ; in rules, e = t ?
-  [report exp ((get_t the_rating - ticks) / lambda)]
+  ; if component = "RT" [...]
+  let recency_factor exp ((get_t the_rating - ticks) / lambda)
+  if typ = "Test" and p_menteur > 0 [
+    let id_provider [who] of get_provider the_rating
+    if component = "CR" and table:has-key? defiance id_provider [report max list 0.01 (recency_factor * table:get defiance id_provider)]
+    let id_consumer [who] of get_consumer the_rating
+    if component = "WR" and table:has-key? defiance id_consumer [report max list 0.01 (recency_factor * table:get defiance id_consumer)]
+  ]
+  report max list 0.01 recency_factor ; on évite de renvoyer un poids nul
 end
 
 
 ; consumer procedure
 to rate_interaction [chosen_provider the_service]
   let UG performance chosen_provider
+  let new_v UG / 10
   set last_UG UG
   set interacted? True
-  let new_rating array:from-list (list ticks UG (UG / 10) the_service)
+  let new_rating array:from-list (list ticks UG new_v the_service self chosen_provider) ; ratings = [tick, UG, v, service, consumer, provider]
 
   ; update personal rating list (size limit for one provider = H)
   ifelse not table:has-key? ratings [who] of chosen_provider [
@@ -407,6 +415,19 @@ to rate_interaction [chosen_provider the_service]
   ]
 
   ask chosen_provider [set current_interactions fput new_rating current_interactions]
+
+  if typ = "Test" and p_menteur > 0 [
+    ; calcul de la méfiance envers les providers
+    let list_reported_v map [rtg -> get_v rtg] filter [rtg -> get_provider rtg = chosen_provider] table:get all_matching_ratings "CR"
+    if not empty? list_reported_v [table:put defiance [who] of chosen_provider (1 - abs (mean list_reported_v - new_v) / 2)] ; 1 = confiance absolue, 0 = méfiance absolue
+
+    ; calcul de la méfiance envers les autres consumers
+    let informers remove-duplicates map [rtg -> get_consumer rtg] table:get all_matching_ratings "WR"
+    foreach informers [informer ->
+      set list_reported_v map [rtg -> get_v rtg] filter [rtg -> get_provider rtg = chosen_provider and get_consumer rtg = informer] table:get all_matching_ratings "WR"
+      if not empty? list_reported_v [table:put defiance [who] of informer (1 - abs (mean list_reported_v - new_v) / 2)]
+    ]
+  ]
 end
 
 
@@ -419,6 +440,7 @@ to-report performance [the_provider]
     [set perf in_UG_limits random-normal mu sigma]
   ]
 
+  ; dégradation linéaire de la performance
   let d distance the_provider - rescaled_r0
   ifelse d < 0 [report perf]
   [report max list -10 (perf - (d / (world-height - rescaled_r0)) * 20 * degradation)]
@@ -440,7 +462,7 @@ end
 
 to-report distorted_consumer_rating [rating] ; si le contact est un menteur, il inverse les notes qu'il a donné
   let new_v (- get_v rating)
-  report array:from-list (list get_t rating get_UG rating new_v get_service rating)
+  report array:from-list (list get_t rating (new_v * 10) new_v get_service rating get_consumer rating get_provider rating)
 end
 
 
@@ -448,7 +470,7 @@ to-report distorted_provider_rating [rating] ; si le provider est un menteur, il
   let fake_mu (table:get pl_min "good" + table:get pl_max "good") / 2 ; random_in_interval table:get pl_min p table:get pl_max p
   let fake_sigma table:get sigmas "good"
   let new_UG in_UG_limits random-normal fake_mu fake_sigma
-  report array:from-list (list get_t rating new_UG (new_UG / 10) get_service rating)
+  report array:from-list (list get_t rating new_UG (new_UG / 10) get_service rating get_consumer rating get_provider rating)
 end
 
 
@@ -480,6 +502,16 @@ end
 
 to-report get_service [rating]
   report array:item rating 3
+end
+
+
+to-report get_consumer [rating]
+  report array:item rating 4
+end
+
+
+to-report get_provider [rating]
+  report array:item rating 5
 end
 
 
@@ -557,10 +589,10 @@ NIL
 HORIZONTAL
 
 SLIDER
-437
-94
-609
-127
+442
+143
+614
+176
 n_w
 n_w
 0
@@ -572,10 +604,10 @@ NIL
 HORIZONTAL
 
 SLIDER
-439
-136
-611
-169
+442
+179
+614
+212
 r0
 r0
 0
@@ -872,10 +904,10 @@ NIL
 HORIZONTAL
 
 SLIDER
-439
-240
-611
-273
+441
+274
+613
+307
 Nc
 Nc
 1
@@ -887,10 +919,10 @@ NIL
 HORIZONTAL
 
 SLIDER
-439
-276
-611
-309
+441
+310
+613
+343
 Npg
 Npg
 0
@@ -902,10 +934,10 @@ NIL
 HORIZONTAL
 
 SLIDER
-439
-313
-611
-346
+441
+347
+613
+380
 Npo
 Npo
 0
@@ -917,10 +949,10 @@ NIL
 HORIZONTAL
 
 SLIDER
-439
-350
-611
-383
+441
+384
+613
+417
 Npb
 Npb
 0
@@ -932,10 +964,10 @@ NIL
 HORIZONTAL
 
 SLIDER
-440
-393
-612
-426
+441
+421
+613
+454
 Npi
 Npi
 0
@@ -1087,9 +1119,9 @@ HORIZONTAL
 
 BUTTON
 442
-563
+605
 505
-596
+638
 NIL
 setup
 NIL
@@ -1104,9 +1136,9 @@ NIL
 
 BUTTON
 522
-563
+605
 585
-596
+638
 NIL
 go
 T
@@ -1121,9 +1153,9 @@ NIL
 
 SWITCH
 442
-444
+486
 544
-477
+519
 IT-control
 IT-control
 0
@@ -1132,31 +1164,31 @@ IT-control
 
 SWITCH
 442
-479
+521
 544
-512
+554
 WR-control
 WR-control
-1
+0
 1
 -1000
 
 SWITCH
 442
-514
+556
 544
-547
+589
 CR-control
 CR-control
-1
+0
 1
 -1000
 
 SLIDER
-441
+986
+574
+1158
 607
-613
-640
 tick_limit
 tick_limit
 0
@@ -1168,10 +1200,10 @@ NIL
 HORIZONTAL
 
 SLIDER
-438
-173
-610
-206
+442
+215
+614
+248
 degradation
 degradation
 0
@@ -1184,9 +1216,9 @@ HORIZONTAL
 
 SWITCH
 550
-444
+486
 640
-477
+519
 IT-test
 IT-test
 0
@@ -1195,9 +1227,9 @@ IT-test
 
 SWITCH
 550
-479
+521
 640
-512
+554
 WR-test
 WR-test
 0
@@ -1206,9 +1238,9 @@ WR-test
 
 SWITCH
 550
-514
+556
 640
-547
+589
 CR-test
 CR-test
 1
@@ -1310,31 +1342,31 @@ PENS
 "CR" 1.0 0 -5825686 true "" "ifelse not empty? table:get rho \"CR\" [plot mean table:get rho \"CR\"][plot 0]"
 
 SLIDER
-987
-563
-1159
-596
+986
+535
+1158
+568
 p_menteur
 p_menteur
 0
 1
-0.0
+0.6
 .01
 1
 NIL
 HORIZONTAL
 
 SLIDER
-439
-211
-611
-244
-min_T
-min_T
-0.01
+441
+97
+613
+130
+T_min
+T_min
+0.1
 1
 0.1
-0.01
+.1
 1
 NIL
 HORIZONTAL
